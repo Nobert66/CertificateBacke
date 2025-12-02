@@ -4,18 +4,23 @@ import { createCertificatePDF } from "./certificateService.js";
 import { sendCertificateEmail } from "./email.js";
 import path from "path";
 import fs from "fs";
+import { fileURLToPath } from "url"; // Added to correctly use paths in ES modules
 
 const router = express.Router();
 
+// Define __dirname (Crucial for reliable pathing in Node.js modules)
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 // Middleware: simple admin auth via Bearer token (ADMIN_TOKEN)
 function adminAuth(req, res, next) {
-  const auth = req.headers["authorization"];
-  if (!auth) return res.status(401).json({ message: "Missing Authorization header" });
-  const parts = auth.split(" ");
-  if (parts.length !== 2 || parts[0] !== "Bearer" || parts[1] !== process.env.ADMIN_TOKEN) {
-    return res.status(403).json({ message: "Forbidden" });
-  }
-  next();
+    const auth = req.headers["authorization"];
+    if (!auth) return res.status(401).json({ message: "Missing Authorization header" });
+    const parts = auth.split(" ");
+    if (parts.length !== 2 || parts[0] !== "Bearer" || parts[1] !== process.env.ADMIN_TOKEN) {
+        return res.status(403).json({ message: "Forbidden" });
+    }
+    next();
 }
 
 /**
@@ -23,66 +28,108 @@ function adminAuth(req, res, next) {
  * body: { userName, userEmail, resourceName, issuer, autoEmail (true|false) }
  */
 router.post("/generate", async (req, res) => {
-  try {
-    const { userName, userEmail, resourceName, issuer, autoEmail } = req.body;
-    if (!userName || !userEmail || !resourceName) {
-      return res.status(400).json({ message: "userName, userEmail and resourceName required" });
+    try {
+        const { userName, userEmail, resourceName, issuer, autoEmail } = req.body;
+        if (!userName || !userEmail || !resourceName) {
+            return res.status(400).json({ message: "userName, userEmail and resourceName required" });
+        }
+
+        // Create PDF
+        const { pdfPath, certificateId, verificationHash, issuedAt } = await createCertificatePDF({
+            userName,
+            userEmail,
+            resourceName,
+            issuer
+        });
+
+        // Save metadata to DB
+        const cert = new Certificate({
+            certificateId,
+            userName,
+            userEmail,
+            resourceName,
+            pdfPath,
+            verificationHash,
+            issuer,
+            issuedAt
+        });
+        await cert.save();
+
+        // Optionally email the cert
+        if (autoEmail) {
+            // attachment full path (Logic remains the same, relies on process.cwd())
+            const fullPath = path.join(process.cwd(), pdfPath.replace(/^\//, ""));
+            await sendCertificateEmail({
+                to: userEmail,
+                subject: `Your certificate for ${resourceName}`,
+                text: `Hello ${userName},\n\nAttached is your certificate for ${resourceName}.`,
+                html: `<p>Hello ${userName},</p><p>Attached is your certificate for <b>${resourceName}</b>.</p>`,
+                attachmentPath: fullPath,
+                attachmentName: `${certificateId}.pdf`
+            });
+        }
+
+        res.json({ message: "Certificate generated", certificateId, pdfPath, verificationHash });
+    } catch (err) {
+        console.error("Error generating certificate:", err);
+        res.status(500).json({ message: "Server error", error: err.message });
     }
-
-    // Create PDF
-    const { pdfPath, certificateId, verificationHash, issuedAt } = await createCertificatePDF({
-      userName,
-      userEmail,
-      resourceName,
-      issuer
-    });
-
-    // Save metadata to DB
-    const cert = new Certificate({
-      certificateId,
-      userName,
-      userEmail,
-      resourceName,
-      pdfPath,
-      verificationHash,
-      issuer,
-      issuedAt
-    });
-    await cert.save();
-
-    // Optionally email the cert
-    if (autoEmail) {
-      // attachment full path
-      const fullPath = path.join(process.cwd(), pdfPath.replace(/^\//, ""));
-      await sendCertificateEmail({
-        to: userEmail,
-        subject: `Your certificate for ${resourceName}`,
-        text: `Hello ${userName},\n\nAttached is your certificate for ${resourceName}.`,
-        html: `<p>Hello ${userName},</p><p>Attached is your certificate for <b>${resourceName}</b>.</p>`,
-        attachmentPath: fullPath,
-        attachmentName: `${certificateId}.pdf`
-      });
-    }
-
-    res.json({ message: "Certificate generated", certificateId, pdfPath, verificationHash });
-  } catch (err) {
-    console.error("Error generating certificate:", err);
-    res.status(500).json({ message: "Server error", error: err.message });
-  }
 });
+
+// --- NEW PUBLIC DOWNLOAD ROUTE ADDED HERE ---
+/**
+ * GET /api/certificates/download/:id
+ * Public endpoint to download the certificate PDF
+ */
+router.get("/download/:id", async (req, res) => {
+    try {
+        const cert = await Certificate.findOne({ certificateId: req.params.id });
+        if (!cert) return res.status(404).json({ message: "Certificate not found" });
+
+        // pdfPath is saved in the DB (e.g., /certificates/XYZ.pdf)
+        const pdfFileName = cert.pdfPath.replace(/^\//, ""); // Removes the leading '/'
+
+        // **FIXED PATH LOGIC:** Use path.join(process.cwd(), ...) to construct the absolute path,
+        // consistent with your other routes.
+        const fullPath = path.join(process.cwd(), pdfFileName); 
+        
+        if (!fs.existsSync(fullPath)) {
+            console.error(`File not found at: ${fullPath}`);
+            // This is the common error on Render after sleep/restart
+            return res.status(404).json({ message: "Certificate file is missing from server storage. Please regenerate." });
+        }
+
+        // Use res.download to send the file
+        res.download(fullPath, `${cert.certificateId}.pdf`, (err) => {
+            if (err) {
+                console.error("res.download error:", err);
+                // Send a generic error for download failures not related to file existence
+                if (!res.headersSent) {
+                    res.status(500).send("Could not complete download.");
+                }
+            }
+        });
+
+    } catch (err) {
+        console.error("Error retrieving certificate for download:", err);
+        res.status(500).json({ message: "Server error" });
+    }
+});
+// ---------------------------------------------
+
 
 /**
  * GET /api/certificates/:id
  * Get certificate metadata (admin)
  */
 router.get("/:id", adminAuth, async (req, res) => {
-  try {
-    const cert = await Certificate.findOne({ certificateId: req.params.id });
-    if (!cert) return res.status(404).json({ message: "Not found" });
-    res.json(cert);
-  } catch (err) {
-    res.status(500).json({ message: "Server error" });
-  }
+    try {
+        const cert = await Certificate.findOne({ certificateId: req.params.id });
+        if (!cert) return res.status(404).json({ message: "Not found" });
+        res.json(cert);
+    } catch (err) {
+        res.status(500).json({ message: "Server error" });
+    }
 });
 
 /**
@@ -90,18 +137,18 @@ router.get("/:id", adminAuth, async (req, res) => {
  * Accepts optional ?page=&limit=
  */
 router.get("/", adminAuth, async (req, res) => {
-  try {
-    const page = Math.max(0, Number(req.query.page || 0));
-    const limit = Math.max(1, Number(req.query.limit || 50));
-    const certs = await Certificate.find()
-      .sort({ issuedAt: -1 })
-      .skip(page * limit)
-      .limit(limit)
-      .lean();
-    res.json({ page, limit, results: certs });
-  } catch (err) {
-    res.status(500).json({ message: "Server error" });
-  }
+    try {
+        const page = Math.max(0, Number(req.query.page || 0));
+        const limit = Math.max(1, Number(req.query.limit || 50));
+        const certs = await Certificate.find()
+            .sort({ issuedAt: -1 })
+            .skip(page * limit)
+            .limit(limit)
+            .lean();
+        res.json({ page, limit, results: certs });
+    } catch (err) {
+        res.status(500).json({ message: "Server error" });
+    }
 });
 
 /**
@@ -109,38 +156,39 @@ router.get("/", adminAuth, async (req, res) => {
  * Public verification endpoint used by QR code
  */
 router.get("/verify/:hash", async (req, res) => {
-  try {
-    const { hash } = req.params;
-    const cert = await Certificate.findOne({ verificationHash: hash }).lean();
-    if (!cert) return res.status(404).json({ valid: false, message: "Certificate not found or invalid" });
-    res.json({
-      valid: true,
-      certificateId: cert.certificateId,
-      userName: cert.userName,
-      resourceName: cert.resourceName,
-      issuer: cert.issuer,
-      issuedAt: cert.issuedAt,
-      pdfPath: cert.pdfPath
-    });
-  } catch (err) {
-    res.status(500).json({ message: "Server error" });
-  }
+    try {
+        const { hash } = req.params;
+        const cert = await Certificate.findOne({ verificationHash: hash }).lean();
+        if (!cert) return res.status(404).json({ valid: false, message: "Certificate not found or invalid" });
+        res.json({
+            valid: true,
+            certificateId: cert.certificateId,
+            userName: cert.userName,
+            resourceName: cert.resourceName,
+            issuer: cert.issuer,
+            issuedAt: cert.issuedAt,
+            // Include the download link here instead of the raw pdfPath
+            downloadLink: `/api/certificates/download/${cert.certificateId}` 
+        });
+    } catch (err) {
+        res.status(500).json({ message: "Server error" });
+    }
 });
 
 /**
  * DELETE /api/certificates/:id (admin) - deletes certificate and PDF
  */
 router.delete("/:id", adminAuth, async (req, res) => {
-  try {
-    const cert = await Certificate.findOneAndDelete({ certificateId: req.params.id });
-    if (!cert) return res.status(404).json({ message: "Not found" });
-    // delete file
-    const fullPath = path.join(process.cwd(), cert.pdfPath.replace(/^\//, ""));
-    if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
-    res.json({ message: "Deleted" });
-  } catch (err) {
-    res.status(500).json({ message: "Server error" });
-  }
+    try {
+        const cert = await Certificate.findOneAndDelete({ certificateId: req.params.id });
+        if (!cert) return res.status(404).json({ message: "Not found" });
+        // delete file
+        const fullPath = path.join(process.cwd(), cert.pdfPath.replace(/^\//, ""));
+        if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
+        res.json({ message: "Deleted" });
+    } catch (err) {
+        res.status(500).json({ message: "Server error" });
+    }
 });
 
 export default router;
